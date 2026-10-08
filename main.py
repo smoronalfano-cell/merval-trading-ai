@@ -1,9 +1,9 @@
 import datetime
-import os
 import numpy as np
 import pandas as pd
 import ta
 import yfinance as yf
+import os
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -11,24 +11,19 @@ from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 
-app = FastAPI(title="Merval Trading AI Engine - Dual Signal & Portfolio")
+app = FastAPI(title="Merval Trading AI Engine - Multi-Variable Precision Engine")
 
-# --- CONFIGURACIÓN DE BASE DE DATOS (SUPABASE / POSTGRESQL) ---
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres.fbbezuunqmxmhyprviug:Merval-DBV1@aws-1-sa-east-1.pooler.supabase.com:5432/postgres"
-)
-
-# Corrección de esquema por si la URL viene como 'postgres://'
+# Soporte para PostgreSQL (Supabase) o SQLite como fallback
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./merval_yfinance.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(DATABASE_URL)
+connect_args = {"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
 Base = declarative_base()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
-# --- MODELOS DE BASE DE DATOS ---
 class Recomendacion(Base):
     __tablename__ = "recomendaciones"
 
@@ -73,7 +68,6 @@ class PosicionSchema(BaseModel):
     precio_compra: float
 
 
-# --- LÓGICA DE ANÁLISIS TÉCNICO Y ONDAS DE ELLIOTT ---
 def estimar_onda_elliott(df: pd.DataFrame) -> dict:
     if len(df) < 30:
         return {"fase": "Datos insuficientes", "bias": "NEUTRAL"}
@@ -132,7 +126,7 @@ def procesar_ticker_yfinance(ticker_input: str):
     ticker_obj = yf.Ticker(ticker_yf)
     df = ticker_obj.history(period="6mo", interval="1d")
 
-    if df.empty or len(df) < 10:
+    if df.empty or len(df) < 30:
         raise HTTPException(
             status_code=404,
             detail=f"No se obtuvieron suficientes datos en Yahoo Finance para {ticker_yf}."
@@ -142,6 +136,19 @@ def procesar_ticker_yfinance(ticker_input: str):
     df['RSI'] = ta.momentum.RSIIndicator(close=close_series, window=14).rsi()
     df['SMA_20'] = ta.trend.SMAIndicator(close=close_series, window=20).sma_indicator()
     df['SMA_50'] = ta.trend.SMAIndicator(close=close_series, window=50).sma_indicator()
+    
+    # NUEVOS INDICADORES DE PRECISIÓN
+    # MACD
+    macd_ind = ta.trend.MACD(close=close_series)
+    df['MACD'] = macd_ind.macd()
+    df['MACD_SIGNAL'] = macd_ind.macd_signal()
+    df['MACD_HIST'] = macd_ind.macd_diff()
+
+    # VOLUMEN SMA 20
+    df['VOL_SMA_20'] = ta.trend.SMAIndicator(close=df['Volume'], window=20).sma_indicator()
+
+    # ATR (Average True Range para Stop Loss / Take Profit dinámico)
+    df['ATR'] = ta.volatility.AverageTrueRange(high=df['High'], low=df['Low'], close=close_series, window=14).average_true_range()
 
     ultimo = df.iloc[-1]
     precio_actual = round(float(ultimo['Close']), 2)
@@ -152,14 +159,25 @@ def procesar_ticker_yfinance(ticker_input: str):
     rsi_val = round(float(ultimo['RSI']), 2) if pd.notnull(ultimo['RSI']) else 50.0
     sma20_val = round(float(ultimo['SMA_20']), 2) if pd.notnull(ultimo['SMA_20']) else precio_actual
     sma50_val = round(float(ultimo['SMA_50']), 2) if pd.notnull(ultimo['SMA_50']) else precio_actual
+    
+    macd_hist = float(ultimo['MACD_HIST']) if pd.notnull(ultimo['MACD_HIST']) else 0.0
+    vol_actual = float(ultimo['Volume']) if pd.notnull(ultimo['Volume']) else 0
+    vol_sma20 = float(ultimo['VOL_SMA_20']) if pd.notnull(ultimo['VOL_SMA_20']) else 1
+    atr_val = float(ultimo['ATR']) if pd.notnull(ultimo['ATR']) else (precio_actual * 0.04)
 
-    if rsi_val < 35 and precio_actual > sma20_val:
-        rec_tecnica = "COMPRA FUERTE"
-    elif rsi_val < 45:
+    # REGLAS DE FILTRADO MULTIVARIABLE
+    volumen_fuerte = vol_actual > vol_sma20
+    vela_alcista = float(ultimo['Close']) > float(ultimo['Open'])
+    tendencia_alcista = sma20_val > sma50_val and macd_hist > 0
+
+    # Puntuación Técnica Integrada
+    if rsi_val < 38 and tendencia_alcista and volumen_fuerte and vela_alcista:
+        rec_tecnica = "COMPRA FUERTE (ALTA CONVICCION)"
+    elif (rsi_val < 48 and tendencia_alcista) or (rsi_val < 35 and vela_alcista):
         rec_tecnica = "COMPRA"
-    elif rsi_val > 70:
+    elif rsi_val > 70 or (rsi_val > 62 and macd_hist < 0 and not vela_alcista):
         rec_tecnica = "VENTA FUERTE"
-    elif rsi_val > 60:
+    elif rsi_val > 58 and not tendencia_alcista:
         rec_tecnica = "VENTA"
     else:
         rec_tecnica = "MANTENER"
@@ -168,26 +186,26 @@ def procesar_ticker_yfinance(ticker_input: str):
     elliott_fase = elliott_info["fase"]
     elliott_bias = elliott_info["bias"]
 
-    if "COMPRA" in rec_tecnica and ("COMPRA" in elliott_bias or "ALCISTA" in elliott_bias):
-        rec_final = "COMPRA FUERTE (CONFLUENCIA)"
-        sl = round(precio_actual * 0.94, 2)
-        tp = round(precio_actual * 1.12, 2)
-    elif "COMPRA" in rec_tecnica or "OPORTUNIDAD_COMPRA" in elliott_bias:
+    # MATRIZ FINAL DE DECISIÓN
+    if "COMPRA FUERTE" in rec_tecnica and ("COMPRA" in elliott_bias or "ALCISTA" in elliott_bias):
+        rec_final = "COMPRA FUERTE (ALTA CONFLUENCIA)"
+        mult_sl, mult_tp = 1.5, 3.0
+    elif "COMPRA" in rec_tecnica and "BAJISTA" not in elliott_bias:
         rec_final = "COMPRA"
-        sl = round(precio_actual * 0.96, 2)
-        tp = round(precio_actual * 1.08, 2)
-    elif "VENTA" in rec_tecnica and "BAJISTA" in elliott_bias:
-        rec_final = "VENTA FUERTE (CONFLUENCIA)"
-        sl = round(precio_actual * 1.04, 2)
-        tp = round(precio_actual * 0.88, 2)
+        mult_sl, mult_tp = 1.2, 2.2
+    elif "VENTA FUERTE" in rec_tecnica or ("VENTA" in rec_tecnica and "BAJISTA" in elliott_bias):
+        rec_final = "VENTA FUERTE"
+        mult_sl, mult_tp = 1.2, 2.0
     elif "VENTA" in rec_tecnica or elliott_bias == "BAJISTA":
         rec_final = "VENTA"
-        sl = round(precio_actual * 1.03, 2)
-        tp = round(precio_actual * 0.92, 2)
+        mult_sl, mult_tp = 1.0, 1.8
     else:
-        rec_final = "MANTENER"
-        sl = round(precio_actual * 0.97, 2)
-        tp = round(precio_actual * 1.05, 2)
+        rec_final = "NEUTRAL / MANTENER"
+        mult_sl, mult_tp = 1.0, 1.5
+
+    # Stop Loss y Take Profit adaptados a la volatilidad real (ATR)
+    sl = round(precio_actual - (atr_val * mult_sl), 2)
+    tp = round(precio_actual + (atr_val * mult_tp), 2)
 
     return {
         "ticker": ticker_yf,
@@ -203,7 +221,6 @@ def procesar_ticker_yfinance(ticker_input: str):
     }
 
 
-# --- INTERFAZ WEB HTML ---
 @app.get("/", response_class=HTMLResponse)
 def index():
     html_content = """
@@ -219,7 +236,7 @@ def index():
         <div class="max-w-6xl mx-auto space-y-6">
             
             <header class="flex justify-between items-center border-b border-gray-800 pb-4">
-                <h1 class="text-2xl font-bold text-emerald-400">📊 Merval AI Engine</h1>
+                <h1 class="text-2xl font-bold text-emerald-400">📊 Merval AI Engine (Multi-Variable)</h1>
                 <nav class="flex gap-4">
                     <button id="tabAnalizadorBtn" onclick="verTab('analizador')" class="px-4 py-2 bg-emerald-600 font-bold rounded">Analizador</button>
                     <button id="tabPortafolioBtn" onclick="verTab('portafolio')" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded">Mi Portafolio</button>
@@ -228,6 +245,7 @@ def index():
 
             <!-- SECCION ANALIZADOR -->
             <div id="secAnalizador" class="space-y-6">
+                <!-- Buscador -->
                 <section class="bg-gray-800 p-4 rounded-lg shadow-lg flex gap-4">
                     <input id="tickerInput" type="text" placeholder="Ej: EDN, YPFD, GGAL, BMA, PAMP..." 
                            class="flex-1 bg-gray-700 text-white px-4 py-2 rounded focus:outline-none focus:ring-2 focus:ring-emerald-500 uppercase">
@@ -237,6 +255,7 @@ def index():
                     </button>
                 </section>
 
+                <!-- Resultado -->
                 <section id="resultadoCard" class="hidden bg-gray-800 p-6 rounded-lg shadow-lg space-y-4">
                     <div class="flex justify-between items-center border-b border-gray-700 pb-2">
                         <h2 id="resTicker" class="text-2xl font-bold text-emerald-400"></h2>
@@ -245,7 +264,7 @@ def index():
 
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div class="bg-gray-700/60 p-4 rounded-lg border border-gray-600">
-                            <p class="text-xs text-gray-400 font-semibold uppercase tracking-wider">Variable 1: Análisis Técnico (RSI / SMA)</p>
+                            <p class="text-xs text-gray-400 font-semibold uppercase tracking-wider">Variable 1: Análisis Multi-Técnico (RSI, MACD, Vol, SMA)</p>
                             <p id="resTecnica" class="text-lg font-bold text-emerald-300 mt-1"></p>
                         </div>
                         <div class="bg-gray-700/60 p-4 rounded-lg border border-gray-600">
@@ -264,16 +283,17 @@ def index():
                             <p id="resRsi" class="text-lg font-semibold mt-1"></p>
                         </div>
                         <div class="bg-gray-700 p-3 rounded">
-                            <p class="text-gray-400 text-sm">Stop Loss (SL)</p>
+                            <p class="text-gray-400 text-sm">Stop Loss Dinámico (ATR)</p>
                             <p id="resSL" class="text-lg font-semibold text-red-400 mt-1"></p>
                         </div>
                         <div class="bg-gray-700 p-3 rounded">
-                            <p class="text-gray-400 text-sm">Take Profit (TP)</p>
+                            <p class="text-gray-400 text-sm">Take Profit Dinámico (ATR)</p>
                             <p id="resTP" class="text-lg font-semibold text-green-400 mt-1"></p>
                         </div>
                     </div>
                 </section>
 
+                <!-- Historial -->
                 <section class="bg-gray-800 p-6 rounded-lg shadow-lg">
                     <div class="flex justify-between items-center mb-4">
                         <h2 class="text-xl font-bold">Historial de Señales Guardadas</h2>
@@ -308,6 +328,7 @@ def index():
 
             <!-- SECCION PORTAFOLIO -->
             <div id="secPortafolio" class="hidden space-y-6">
+                <!-- Formulario Agregar Posicion -->
                 <section class="bg-gray-800 p-6 rounded-lg shadow-lg">
                     <h2 class="text-xl font-bold mb-4 text-emerald-400">💼 Registrar Acción Comprada</h2>
                     <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -318,6 +339,7 @@ def index():
                     </div>
                 </section>
 
+                <!-- Tabla de Tenencias y Recomendaciones de Venta -->
                 <section class="bg-gray-800 p-6 rounded-lg shadow-lg">
                     <div class="flex justify-between items-center mb-4">
                         <h2 class="text-xl font-bold">Monitoreo y Recomendaciones de Venta</h2>
@@ -452,6 +474,7 @@ def index():
                 }
             }
 
+            // FUNCIONES PORTAFOLIO
             async function guardarPosicion() {
                 const ticker = document.getElementById('portTicker').value.trim();
                 const cantidad = parseFloat(document.getElementById('portCantidad').value);
@@ -506,6 +529,7 @@ def index():
 
                     data.posiciones.forEach(p => {
                         const tr = document.createElement('tr');
+
                         let pnlColor = p.pnl_monto >= 0 ? 'text-green-400 font-bold' : 'text-red-400 font-bold';
                         
                         let recBadge = '<span class="px-2 py-1 bg-gray-700 text-gray-300 rounded text-xs font-bold">MANTENER</span>';
@@ -543,7 +567,6 @@ def index():
     return HTMLResponse(content=html_content)
 
 
-# --- ENDPOINTS API ---
 @app.get("/api/consultar/{ticker}")
 def consultar_y_registrar(ticker: str, db: Session = Depends(get_db)):
     datos = procesar_ticker_yfinance(ticker)
@@ -651,7 +674,7 @@ def comparar_historial(db: Session = Depends(get_db)):
     }
 
 
-# --- ENDPOINTS PORTAFOLIO ---
+# ENDPOINTS DE PORTAFOLIO
 @app.post("/api/portafolio/agregar")
 def agregar_portafolio(pos: PosicionSchema, db: Session = Depends(get_db)):
     ticker_clean = pos.ticker.strip().upper()
@@ -709,7 +732,7 @@ def obtener_portafolio(db: Session = Depends(get_db)):
         inversion_total += inversion_item
         valor_actual_total += valor_item
 
-        # Lógica de recomendaciones de VENTA
+        # Reglas AI para recomendar VENTA
         if pnl_pct <= -6.0:
             rec_venta = "EJECUTAR STOP LOSS (CERRAR)"
         elif pnl_pct >= 15.0:
