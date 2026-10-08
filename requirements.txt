@@ -1,7 +1,10 @@
 fastapi
 uvicorn
 sqlalchemy
+psycopg2-binary
 yfinance
 ta
 pandas
 numpy
+psycopg[binary]
+psycopg2-binary
