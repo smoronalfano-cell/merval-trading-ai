@@ -1,22 +1,34 @@
 import datetime
+import os
 import numpy as np
 import pandas as pd
 import ta
 import yfinance as yf
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 
-app = FastAPI(title="Merval Trading AI Engine - Dual Signal")
+app = FastAPI(title="Merval Trading AI Engine - Dual Signal & Portfolio")
 
-DATABASE_URL = "sqlite:///./merval_yfinance.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+# --- CONFIGURACIÓN DE BASE DE DATOS (SUPABASE / POSTGRESQL) ---
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres.fbbezuunqmxmhyprviug:Merval-DBV1@aws-1-sa-east-1.pooler.supabase.com:5432/postgres"
+)
+
+# Corrección de esquema por si la URL viene como 'postgres://'
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(DATABASE_URL)
 Base = declarative_base()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
+# --- MODELOS DE BASE DE DATOS ---
 class Recomendacion(Base):
     __tablename__ = "recomendaciones"
 
@@ -34,6 +46,16 @@ class Recomendacion(Base):
     take_profit = Column(Float)
 
 
+class PosicionPortafolio(Base):
+    __tablename__ = "portafolio"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String, index=True)
+    cantidad = Column(Float)
+    precio_compra = Column(Float)
+    fecha_compra = Column(DateTime, default=datetime.datetime.utcnow)
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -45,6 +67,13 @@ def get_db():
         db.close()
 
 
+class PosicionSchema(BaseModel):
+    ticker: str
+    cantidad: float
+    precio_compra: float
+
+
+# --- LÓGICA DE ANÁLISIS TÉCNICO Y ONDAS DE ELLIOTT ---
 def estimar_onda_elliott(df: pd.DataFrame) -> dict:
     if len(df) < 30:
         return {"fase": "Datos insuficientes", "bias": "NEUTRAL"}
@@ -174,6 +203,7 @@ def procesar_ticker_yfinance(ticker_input: str):
     }
 
 
+# --- INTERFAZ WEB HTML ---
 @app.get("/", response_class=HTMLResponse)
 def index():
     html_content = """
@@ -182,100 +212,166 @@ def index():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Merval Trading AI - Dual Strategy</title>
+        <title>Merval AI Engine - Portfolio & Analysis</title>
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-gray-900 text-gray-100 min-h-screen p-6 font-sans">
         <div class="max-w-6xl mx-auto space-y-6">
             
             <header class="flex justify-between items-center border-b border-gray-800 pb-4">
-                <h1 class="text-2xl font-bold text-emerald-400">📊 Merval AI Engine (Técnico + Elliott)</h1>
-                <span class="text-sm text-gray-400">FastAPI + Multi-Variable AI Engine</span>
+                <h1 class="text-2xl font-bold text-emerald-400">📊 Merval AI Engine</h1>
+                <nav class="flex gap-4">
+                    <button id="tabAnalizadorBtn" onclick="verTab('analizador')" class="px-4 py-2 bg-emerald-600 font-bold rounded">Analizador</button>
+                    <button id="tabPortafolioBtn" onclick="verTab('portafolio')" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded">Mi Portafolio</button>
+                </nav>
             </header>
 
-            <!-- Buscador -->
-            <section class="bg-gray-800 p-4 rounded-lg shadow-lg flex gap-4">
-                <input id="tickerInput" type="text" placeholder="Ej: EDN, YPFD, GGAL, BMA, PAMP..." 
-                       class="flex-1 bg-gray-700 text-white px-4 py-2 rounded focus:outline-none focus:ring-2 focus:ring-emerald-500 uppercase">
-                <button onclick="consultarTicker()" 
-                        class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-6 py-2 rounded transition">
-                    Consultar Ticker
-                </button>
-            </section>
+            <!-- SECCION ANALIZADOR -->
+            <div id="secAnalizador" class="space-y-6">
+                <section class="bg-gray-800 p-4 rounded-lg shadow-lg flex gap-4">
+                    <input id="tickerInput" type="text" placeholder="Ej: EDN, YPFD, GGAL, BMA, PAMP..." 
+                           class="flex-1 bg-gray-700 text-white px-4 py-2 rounded focus:outline-none focus:ring-2 focus:ring-emerald-500 uppercase">
+                    <button onclick="consultarTicker()" 
+                            class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-6 py-2 rounded transition">
+                        Consultar Ticker
+                    </button>
+                </section>
 
-            <!-- Resultado -->
-            <section id="resultadoCard" class="hidden bg-gray-800 p-6 rounded-lg shadow-lg space-y-4">
-                <div class="flex justify-between items-center border-b border-gray-700 pb-2">
-                    <h2 id="resTicker" class="text-2xl font-bold text-emerald-400"></h2>
-                    <span id="resPrecio" class="text-2xl font-bold text-white"></span>
-                </div>
+                <section id="resultadoCard" class="hidden bg-gray-800 p-6 rounded-lg shadow-lg space-y-4">
+                    <div class="flex justify-between items-center border-b border-gray-700 pb-2">
+                        <h2 id="resTicker" class="text-2xl font-bold text-emerald-400"></h2>
+                        <span id="resPrecio" class="text-2xl font-bold text-white"></span>
+                    </div>
 
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div class="bg-gray-700/60 p-4 rounded-lg border border-gray-600">
-                        <p class="text-xs text-gray-400 font-semibold uppercase tracking-wider">Variable 1: Análisis Técnico (RSI / SMA)</p>
-                        <p id="resTecnica" class="text-lg font-bold text-emerald-300 mt-1"></p>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div class="bg-gray-700/60 p-4 rounded-lg border border-gray-600">
+                            <p class="text-xs text-gray-400 font-semibold uppercase tracking-wider">Variable 1: Análisis Técnico (RSI / SMA)</p>
+                            <p id="resTecnica" class="text-lg font-bold text-emerald-300 mt-1"></p>
+                        </div>
+                        <div class="bg-gray-700/60 p-4 rounded-lg border border-gray-600">
+                            <p class="text-xs text-indigo-300 font-semibold uppercase tracking-wider">Variable 2: Ondas de Elliott</p>
+                            <p id="resElliott" class="text-lg font-bold text-indigo-200 mt-1"></p>
+                        </div>
                     </div>
-                    <div class="bg-gray-700/60 p-4 rounded-lg border border-gray-600">
-                        <p class="text-xs text-indigo-300 font-semibold uppercase tracking-wider">Variable 2: Ondas de Elliott</p>
-                        <p id="resElliott" class="text-lg font-bold text-indigo-200 mt-1"></p>
-                    </div>
-                </div>
 
-                <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
-                    <div class="bg-gray-700 p-3 rounded">
-                        <p class="text-gray-400 text-sm">Señal Final</p>
-                        <p id="resRec" class="text-lg font-bold mt-1 text-emerald-400"></p>
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
+                        <div class="bg-gray-700 p-3 rounded">
+                            <p class="text-gray-400 text-sm">Señal Final</p>
+                            <p id="resRec" class="text-lg font-bold mt-1 text-emerald-400"></p>
+                        </div>
+                        <div class="bg-gray-700 p-3 rounded">
+                            <p class="text-gray-400 text-sm">RSI (14)</p>
+                            <p id="resRsi" class="text-lg font-semibold mt-1"></p>
+                        </div>
+                        <div class="bg-gray-700 p-3 rounded">
+                            <p class="text-gray-400 text-sm">Stop Loss (SL)</p>
+                            <p id="resSL" class="text-lg font-semibold text-red-400 mt-1"></p>
+                        </div>
+                        <div class="bg-gray-700 p-3 rounded">
+                            <p class="text-gray-400 text-sm">Take Profit (TP)</p>
+                            <p id="resTP" class="text-lg font-semibold text-green-400 mt-1"></p>
+                        </div>
                     </div>
-                    <div class="bg-gray-700 p-3 rounded">
-                        <p class="text-gray-400 text-sm">RSI (14)</p>
-                        <p id="resRsi" class="text-lg font-semibold mt-1"></p>
-                    </div>
-                    <div class="bg-gray-700 p-3 rounded">
-                        <p class="text-gray-400 text-sm">Stop Loss (SL)</p>
-                        <p id="resSL" class="text-lg font-semibold text-red-400 mt-1"></p>
-                    </div>
-                    <div class="bg-gray-700 p-3 rounded">
-                        <p class="text-gray-400 text-sm">Take Profit (TP)</p>
-                        <p id="resTP" class="text-lg font-semibold text-green-400 mt-1"></p>
-                    </div>
-                </div>
-            </section>
+                </section>
 
-            <!-- Historial -->
-            <section class="bg-gray-800 p-6 rounded-lg shadow-lg">
-                <div class="flex justify-between items-center mb-4">
-                    <h2 class="text-xl font-bold">Historial de Señales Guardadas</h2>
-                    <button onclick="cargarHistorial()" class="text-sm bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded">Actualizar</button>
-                </div>
-                
-                <div id="resumenStats" class="mb-4 text-sm text-gray-300"></div>
+                <section class="bg-gray-800 p-6 rounded-lg shadow-lg">
+                    <div class="flex justify-between items-center mb-4">
+                        <h2 class="text-xl font-bold">Historial de Señales Guardadas</h2>
+                        <button onclick="cargarHistorial()" class="text-sm bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded">Actualizar</button>
+                    </div>
+                    
+                    <div id="resumenStats" class="mb-4 text-sm text-gray-300"></div>
 
-                <div class="overflow-x-auto">
-                    <table class="w-full text-left text-sm text-gray-300">
-                        <thead class="bg-gray-700 text-gray-400 uppercase text-xs">
-                            <tr>
-                                <th class="p-3">Fecha</th>
-                                <th class="p-3">Ticker</th>
-                                <th class="p-3">P. Entrada</th>
-                                <th class="p-3">Var 1: Técnica</th>
-                                <th class="p-3">Var 2: Elliott</th>
-                                <th class="p-3">Señal Final</th>
-                                <th class="p-3">P. Actual</th>
-                                <th class="p-3">Variación</th>
-                                <th class="p-3">Resultado</th>
-                                <th class="p-3 text-center">Acción</th>
-                            </tr>
-                        </thead>
-                        <tbody id="tablaHistorial" class="divide-y divide-gray-700">
-                            <tr><td colspan="10" class="p-4 text-center text-gray-500">Cargando datos...</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </section>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left text-sm text-gray-300">
+                            <thead class="bg-gray-700 text-gray-400 uppercase text-xs">
+                                <tr>
+                                    <th class="p-3">Fecha</th>
+                                    <th class="p-3">Ticker</th>
+                                    <th class="p-3">P. Entrada</th>
+                                    <th class="p-3">Var 1: Técnica</th>
+                                    <th class="p-3">Var 2: Elliott</th>
+                                    <th class="p-3">Señal Final</th>
+                                    <th class="p-3">P. Actual</th>
+                                    <th class="p-3">Variación</th>
+                                    <th class="p-3">Resultado</th>
+                                    <th class="p-3 text-center">Acción</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tablaHistorial" class="divide-y divide-gray-700">
+                                <tr><td colspan="10" class="p-4 text-center text-gray-500">Cargando datos...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+
+            <!-- SECCION PORTAFOLIO -->
+            <div id="secPortafolio" class="hidden space-y-6">
+                <section class="bg-gray-800 p-6 rounded-lg shadow-lg">
+                    <h2 class="text-xl font-bold mb-4 text-emerald-400">💼 Registrar Acción Comprada</h2>
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                        <input id="portTicker" type="text" placeholder="Ticker (ej: YPFD)" class="bg-gray-700 px-3 py-2 rounded text-white uppercase focus:outline-none">
+                        <input id="portCantidad" type="number" placeholder="Cantidad (ej: 50)" class="bg-gray-700 px-3 py-2 rounded text-white focus:outline-none">
+                        <input id="portPrecio" type="number" step="0.01" placeholder="Precio Compra $ (ej: 25000)" class="bg-gray-700 px-3 py-2 rounded text-white focus:outline-none">
+                        <button onclick="guardarPosicion()" class="bg-emerald-600 hover:bg-emerald-500 font-bold px-4 py-2 rounded transition">Guardar en Portafolio</button>
+                    </div>
+                </section>
+
+                <section class="bg-gray-800 p-6 rounded-lg shadow-lg">
+                    <div class="flex justify-between items-center mb-4">
+                        <h2 class="text-xl font-bold">Monitoreo y Recomendaciones de Venta</h2>
+                        <button onclick="cargarPortafolio()" class="text-sm bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded">Actualizar Mercado</button>
+                    </div>
+
+                    <div id="resumenPortafolio" class="mb-4 text-sm text-gray-300"></div>
+
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left text-sm text-gray-300">
+                            <thead class="bg-gray-700 text-gray-400 uppercase text-xs">
+                                <tr>
+                                    <th class="p-3">Ticker</th>
+                                    <th class="p-3">Cantidad</th>
+                                    <th class="p-3">P. Compra</th>
+                                    <th class="p-3">P. Actual</th>
+                                    <th class="p-3">Valor Total</th>
+                                    <th class="p-3">Rendimiento ($)</th>
+                                    <th class="p-3">Rendimiento (%)</th>
+                                    <th class="p-3">Recomendación Venta AI</th>
+                                    <th class="p-3 text-center">Acción</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tablaPortafolio" class="divide-y divide-gray-700">
+                                <tr><td colspan="9" class="p-4 text-center text-gray-500">Cargando portafolio...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
 
         </div>
 
         <script>
+            function verTab(tab) {
+                const secAna = document.getElementById('secAnalizador');
+                const secPort = document.getElementById('secPortafolio');
+                const btnAna = document.getElementById('tabAnalizadorBtn');
+                const btnPort = document.getElementById('tabPortafolioBtn');
+
+                if (tab === 'analizador') {
+                    secAna.classList.remove('hidden');
+                    secPort.classList.add('hidden');
+                    btnAna.className = "px-4 py-2 bg-emerald-600 font-bold rounded";
+                    btnPort.className = "px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded";
+                } else {
+                    secAna.classList.add('hidden');
+                    secPort.classList.remove('hidden');
+                    btnPort.className = "px-4 py-2 bg-emerald-600 font-bold rounded";
+                    btnAna.className = "px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded";
+                    cargarPortafolio();
+                }
+            }
+
             async function consultarTicker() {
                 const ticker = document.getElementById('tickerInput').value.trim();
                 if (!ticker) return alert('Ingresa un ticker válido');
@@ -306,11 +402,7 @@ def index():
                 if (!confirm('¿Seguro que deseas eliminar este registro?')) return;
                 try {
                     const res = await fetch(`/api/eliminar/${id}`, { method: 'DELETE' });
-                    if (res.ok) {
-                        cargarHistorial();
-                    } else {
-                        alert('Error al eliminar el registro');
-                    }
+                    if (res.ok) cargarHistorial();
                 } catch (err) {
                     console.error(err);
                 }
@@ -333,7 +425,6 @@ def index():
 
                     data.historial.forEach(r => {
                         const tr = document.createElement('tr');
-                        
                         let resBadge = '<span class="px-2 py-1 bg-gray-600 rounded text-xs">SIN DATOS</span>';
                         if (r.resultado === 'ACIERTO') resBadge = '<span class="px-2 py-1 bg-green-900 text-green-300 rounded text-xs font-bold">ACIERTO</span>';
                         if (r.resultado === 'FALLO') resBadge = '<span class="px-2 py-1 bg-red-900 text-red-300 rounded text-xs font-bold">FALLO</span>';
@@ -351,15 +442,96 @@ def index():
                             <td class="p-3">${r.variacion_real_pct}</td>
                             <td class="p-3">${resBadge}</td>
                             <td class="p-3 text-center">
-                                <button onclick="eliminarRegistro(${r.id})" class="bg-red-600 hover:bg-red-700 text-white px-2 py-1 rounded text-xs font-bold transition">
-                                    🗑️ Borrar
-                                </button>
+                                <button onclick="eliminarRegistro(${r.id})" class="bg-red-600 hover:bg-red-700 text-white px-2 py-1 rounded text-xs font-bold transition">🗑️ Borrar</button>
                             </td>
                         `;
                         tbody.appendChild(tr);
                     });
                 } catch (err) {
                     console.error("Error al cargar el historial:", err);
+                }
+            }
+
+            async function guardarPosicion() {
+                const ticker = document.getElementById('portTicker').value.trim();
+                const cantidad = parseFloat(document.getElementById('portCantidad').value);
+                const precio = parseFloat(document.getElementById('portPrecio').value);
+
+                if (!ticker || !cantidad || !precio) return alert('Por favor completa todos los campos');
+
+                try {
+                    const res = await fetch('/api/portafolio/agregar', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ ticker: ticker, cantidad: cantidad, precio_compra: precio })
+                    });
+                    if (res.ok) {
+                        document.getElementById('portTicker').value = '';
+                        document.getElementById('portCantidad').value = '';
+                        document.getElementById('portPrecio').value = '';
+                        cargarPortafolio();
+                    } else {
+                        alert('Error al guardar la posición');
+                    }
+                } catch (err) {
+                    console.error(err);
+                }
+            }
+
+            async function borrarPosicion(id) {
+                if (!confirm('¿Deseas quitar esta posición del portafolio?')) return;
+                try {
+                    const res = await fetch(`/api/portafolio/eliminar/${id}`, { method: 'DELETE' });
+                    if (res.ok) cargarPortafolio();
+                } catch (err) {
+                    console.error(err);
+                }
+            }
+
+            async function cargarPortafolio() {
+                try {
+                    const res = await fetch('/api/portafolio');
+                    const data = await res.json();
+                    const tbody = document.getElementById('tablaPortafolio');
+                    tbody.innerHTML = '';
+
+                    if (!data.posiciones || data.posiciones.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="9" class="p-4 text-center text-gray-500">No tienes acciones en tu portafolio aún.</td></tr>';
+                        document.getElementById('resumenPortafolio').innerText = '';
+                        return;
+                    }
+
+                    document.getElementById('resumenPortafolio').innerText = 
+                        `Inversión Total: $ ${data.resumen.inversion_total} | Valor Actual: $ ${data.resumen.valor_actual_total} | Rendimiento Global: $ ${data.resumen.ganancia_total_monto} (${data.resumen.ganancia_total_pct}%)`;
+
+                    data.posiciones.forEach(p => {
+                        const tr = document.createElement('tr');
+                        let pnlColor = p.pnl_monto >= 0 ? 'text-green-400 font-bold' : 'text-red-400 font-bold';
+                        
+                        let recBadge = '<span class="px-2 py-1 bg-gray-700 text-gray-300 rounded text-xs font-bold">MANTENER</span>';
+                        if (p.recomendacion_venta.includes('VENTA') || p.recomendacion_venta.includes('STOP LOSS')) {
+                            recBadge = `<span class="px-2 py-1 bg-red-900 text-red-200 rounded text-xs font-bold">${p.recomendacion_venta}</span>`;
+                        } else if (p.recomendacion_venta.includes('TAKE PROFIT')) {
+                            recBadge = `<span class="px-2 py-1 bg-green-900 text-green-200 rounded text-xs font-bold">${p.recomendacion_venta}</span>`;
+                        }
+
+                        tr.innerHTML = `
+                            <td class="p-3 font-bold">${p.ticker}</td>
+                            <td class="p-3">${p.cantidad}</td>
+                            <td class="p-3">$ ${p.precio_compra}</td>
+                            <td class="p-3">$ ${p.precio_actual}</td>
+                            <td class="p-3">$ ${p.valor_total_actual}</td>
+                            <td class="p-3 ${pnlColor}">$ ${p.pnl_monto}</td>
+                            <td class="p-3 ${pnlColor}">${p.pnl_pct}%</td>
+                            <td class="p-3">${recBadge}</td>
+                            <td class="p-3 text-center">
+                                <button onclick="borrarPosicion(${p.id})" class="bg-red-600 hover:bg-red-700 text-white px-2 py-1 rounded text-xs font-bold transition">🗑️ Eliminar</button>
+                            </td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                } catch (err) {
+                    console.error("Error al cargar portafolio:", err);
                 }
             }
 
@@ -371,6 +543,7 @@ def index():
     return HTMLResponse(content=html_content)
 
 
+# --- ENDPOINTS API ---
 @app.get("/api/consultar/{ticker}")
 def consultar_y_registrar(ticker: str, db: Session = Depends(get_db)):
     datos = procesar_ticker_yfinance(ticker)
@@ -475,4 +648,100 @@ def comparar_historial(db: Session = Depends(get_db)):
             "tasa_acierto_pct": f"{win_rate}%"
         },
         "historial": resultado
+    }
+
+
+# --- ENDPOINTS PORTAFOLIO ---
+@app.post("/api/portafolio/agregar")
+def agregar_portafolio(pos: PosicionSchema, db: Session = Depends(get_db)):
+    ticker_clean = pos.ticker.strip().upper()
+    ticker_yf = f"{ticker_clean}.BA" if not ticker_clean.endswith(".BA") else ticker_clean
+
+    nueva_pos = PosicionPortafolio(
+        ticker=ticker_yf,
+        cantidad=pos.cantidad,
+        precio_compra=pos.precio_compra
+    )
+    db.add(nueva_pos)
+    db.commit()
+    db.refresh(nueva_pos)
+    return {"mensaje": "Posición agregada con éxito", "id": nueva_pos.id}
+
+
+@app.delete("/api/portafolio/eliminar/{id_posicion}")
+def eliminar_portafolio(id_posicion: int, db: Session = Depends(get_db)):
+    pos = db.query(PosicionPortafolio).filter(PosicionPortafolio.id == id_posicion).first()
+    if not pos:
+        raise HTTPException(status_code=404, detail="Posición no encontrada")
+    db.delete(pos)
+    db.commit()
+    return {"mensaje": "Posición eliminada"}
+
+
+@app.get("/api/portafolio")
+def obtener_portafolio(db: Session = Depends(get_db)):
+    posiciones = db.query(PosicionPortafolio).all()
+    if not posiciones:
+        return {"posiciones": [], "resumen": {}}
+
+    inversion_total = 0.0
+    valor_actual_total = 0.0
+    resultado_lista = []
+
+    for p in posiciones:
+        try:
+            analisis = procesar_ticker_yfinance(p.ticker)
+            precio_hoy = analisis["precio"]
+            rsi_hoy = analisis["rsi"]
+            rec_tecnica = analisis["rec_tecnica"]
+            elliott_bias = analisis["elliott_fase"]
+        except Exception:
+            precio_hoy = p.precio_compra
+            rsi_hoy = 50.0
+            rec_tecnica = "MANTENER"
+            elliott_bias = "NEUTRAL"
+
+        inversion_item = p.cantidad * p.precio_compra
+        valor_item = p.cantidad * precio_hoy
+        pnl_monto = valor_item - inversion_item
+        pnl_pct = round(((precio_hoy - p.precio_compra) / p.precio_compra) * 100, 2)
+
+        inversion_total += inversion_item
+        valor_actual_total += valor_item
+
+        # Lógica de recomendaciones de VENTA
+        if pnl_pct <= -6.0:
+            rec_venta = "EJECUTAR STOP LOSS (CERRAR)"
+        elif pnl_pct >= 15.0:
+            rec_venta = "EJECUTAR TAKE PROFIT (ASEGURAR)"
+        elif "VENTA" in rec_tecnica or "BAJISTA" in elliott_bias:
+            rec_venta = "VENTA SUGERIDA (SEÑAL TÉCNICA)"
+        elif rsi_hoy > 68:
+            rec_venta = "VENTA PARCIAL (SOBRECOMPRA)"
+        else:
+            rec_venta = "MANTENER POSICIÓN"
+
+        resultado_lista.append({
+            "id": p.id,
+            "ticker": p.ticker.replace(".BA", ""),
+            "cantidad": p.cantidad,
+            "precio_compra": p.precio_compra,
+            "precio_actual": precio_hoy,
+            "valor_total_actual": round(valor_item, 2),
+            "pnl_monto": round(pnl_monto, 2),
+            "pnl_pct": pnl_pct,
+            "recomendacion_venta": rec_venta
+        })
+
+    ganancia_total_monto = valor_actual_total - inversion_total
+    ganancia_total_pct = round((ganancia_total_monto / inversion_total * 100), 2) if inversion_total > 0 else 0.0
+
+    return {
+        "resumen": {
+            "inversion_total": round(inversion_total, 2),
+            "valor_actual_total": round(valor_actual_total, 2),
+            "ganancia_total_monto": round(ganancia_total_monto, 2),
+            "ganancia_total_pct": ganancia_total_pct
+        },
+        "posiciones": resultado_lista
     }
