@@ -1,0 +1,4 @@
+merval_yfinance.db
+__pycache__/
+.venv/
+*.pyc
